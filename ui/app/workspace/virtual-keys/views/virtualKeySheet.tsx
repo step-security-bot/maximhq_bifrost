@@ -81,12 +81,6 @@ const providerConfigSchema = z.object({
 	allowed_models: z.array(z.string()).optional(),
 	key_ids: z.array(z.string()).optional(), // Keys associated with this provider config
 	// Provider-level budget
-	budget: z
-		.object({
-			max_limit: z.string().optional(),
-			reset_duration: z.string().optional(),
-		})
-		.optional(),
 	budgets: z.array(z.object({
 		max_limit: z.string().optional(),
 		reset_duration: z.string().optional(),
@@ -120,9 +114,11 @@ const formSchema = z
 		customerId: z.string().optional(),
 		isActive: z.boolean(),
 		// Budget
-		budgetMaxLimit: z.string().optional(),
-		budgetResetDuration: z.string().optional(),
 		budgetCalendarAligned: z.boolean(),
+		budgets: z.array(z.object({
+			max_limit: z.string(),
+			reset_duration: z.string(),
+		})).optional(),
 		// Token limits
 		tokenMaxLimit: z.string().optional(),
 		tokenResetDuration: z.string().optional(),
@@ -197,12 +193,6 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 					weight: config.weight ?? "",
 					allowed_models: config.allowed_models,
 					key_ids: config.allow_all_keys ? ["*"] : config.keys?.map((key) => key.key_id) || [],
-					budget: config.budget
-						? {
-								max_limit: String(config.budget.max_limit),
-								reset_duration: config.budget.reset_duration,
-							}
-						: undefined,
 					budgets: config.budgets?.map((b) => ({
 						max_limit: String(b.max_limit),
 						reset_duration: b.reset_duration,
@@ -226,9 +216,10 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 			teamId: virtualKey?.team_id || "",
 			customerId: virtualKey?.customer_id || "",
 			isActive: virtualKey?.is_active ?? true,
-			budgetMaxLimit: virtualKey?.budget ? String(virtualKey.budget.max_limit) : "",
-			budgetResetDuration: virtualKey?.budget?.reset_duration || "1M",
-			budgetCalendarAligned: virtualKey?.budget?.calendar_aligned ?? false,
+			budgets: virtualKey?.budgets && virtualKey.budgets.length > 0
+				? virtualKey.budgets.map((b) => ({ max_limit: String(b.max_limit ?? ""), reset_duration: b.reset_duration ?? "1M" }))
+				: [],
+			budgetCalendarAligned: virtualKey?.calendar_aligned ?? false,
 			tokenMaxLimit: virtualKey?.rate_limit?.token_max_limit ? String(virtualKey.rate_limit.token_max_limit) : "",
 			tokenResetDuration: virtualKey?.rate_limit?.token_reset_duration || "1h",
 			requestMaxLimit: virtualKey?.rate_limit?.request_max_limit ? String(virtualKey.rate_limit.request_max_limit) : "",
@@ -283,11 +274,15 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 	const mcpConfigs = form.watch("mcpConfigs") || [];
 
 	// Watch budget/rate-limit fields for conditional rendering of reset buttons
-	const watchedBudgetMaxLimit = form.watch("budgetMaxLimit");
-	const watchedBudgetResetDuration = form.watch("budgetResetDuration") || "1M";
-	const watchedBudgetCalendarAligned = form.watch("budgetCalendarAligned");
+	const watchedBudgets = form.watch("budgets");
 	const watchedTokenMaxLimit = form.watch("tokenMaxLimit");
 	const watchedRequestMaxLimit = form.watch("requestMaxLimit");
+	const watchedBudgetCalendarAligned = form.watch("budgetCalendarAligned");
+
+	// Derive single-budget-style values from the multi-budget array for calendar alignment UI
+	const firstBudget = watchedBudgets && watchedBudgets.length > 0 ? watchedBudgets[0] : null;
+	const watchedBudgetMaxLimit = firstBudget?.max_limit;
+	const watchedBudgetResetDuration = firstBudget?.reset_duration;
 
 	// Handle adding a new provider configuration
 	const handleAddProvider = (provider: string) => {
@@ -351,18 +346,17 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 
 	const [showCalendarAlignWarning, setShowCalendarAlignWarning] = useState(false);
 
-	const clearVirtualKeyBudget = () => {
-		form.setValue("budgetMaxLimit", "", { shouldDirty: true });
-		form.setValue("budgetResetDuration", "1M", { shouldDirty: true });
-		form.setValue("budgetCalendarAligned", false, { shouldDirty: true });
-	};
-
 	const handleCalendarAlignedChange = (checked: boolean) => {
-		if (checked && isEditing && virtualKey?.budget && !virtualKey.budget.calendar_aligned) {
+		if (checked && isEditing) {
+			// Show warning when enabling on an existing VK
 			setShowCalendarAlignWarning(true);
 		} else {
 			form.setValue("budgetCalendarAligned", checked, { shouldDirty: true });
 		}
+	};
+
+	const clearVirtualKeyBudget = () => {
+		form.setValue("budgets", [], { shouldDirty: true });
 	};
 
 	const clearVirtualKeyRateLimits = () => {
@@ -372,17 +366,7 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 		form.setValue("requestResetDuration", "1h", { shouldDirty: true });
 	};
 
-	const normalizeIntegerField = (value: string | undefined): number | undefined => {
-		if (value === undefined || value === "") return undefined;
-		const num = parseInt(value, 10);
-		return isNaN(num) ? undefined : num;
-	};
-
-	// Helper function to convert string weights to numbers and normalize budget/rate limit fields
-	const normalizeProviderConfigs = (
-		configs: NonNullable<FormData["providerConfigs"]>,
-		existingConfigs?: VirtualKey["provider_configs"],
-	): any[] => {
+	const normalizeProviderConfigs = (configs: typeof providerConfigs, existingConfigs?: VirtualKey["provider_configs"]): any[] => {
 		return configs.map((config) => ({
 			...config,
 			weight:
@@ -393,25 +377,9 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 							? null
 							: parseFloat(config.weight)
 						: config.weight,
-			budget: (() => {
-				const budgetMaxLimit = normalizeNumericField(config.budget?.max_limit);
-				if (budgetMaxLimit !== undefined) {
-					return {
-						max_limit: budgetMaxLimit,
-						reset_duration: config.budget?.reset_duration || "1M",
-					};
-				}
-
-				const existingConfig = existingConfigs?.find((item) => (config.id ? item.id === config.id : item.provider === config.provider));
-				if (existingConfig?.budget) {
-					return {};
-				}
-
-				return undefined;
-			})(),
 			rate_limit: (() => {
-				const tokenMaxLimit = normalizeIntegerField(config.rate_limit?.token_max_limit);
-				const requestMaxLimit = normalizeIntegerField(config.rate_limit?.request_max_limit);
+				const tokenMaxLimit = normalizeNumericField(config.rate_limit?.token_max_limit);
+				const requestMaxLimit = normalizeNumericField(config.rate_limit?.request_max_limit);
 				const hasTokenMaxLimit = tokenMaxLimit !== undefined;
 				const hasRequestMaxLimit = requestMaxLimit !== undefined;
 				if (hasTokenMaxLimit || hasRequestMaxLimit) {
@@ -463,23 +431,23 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 					is_active: data.isActive,
 				};
 
-				// Add budget if enabled
-				const budgetMaxLimit = normalizeNumericField(data.budgetMaxLimit);
-				const hadBudget = !!virtualKey.budget;
-				const hasBudget = budgetMaxLimit !== undefined;
-				if (hasBudget) {
-					updateData.budget = {
-						max_limit: budgetMaxLimit,
-						reset_duration: data.budgetResetDuration || "1M",
-						calendar_aligned: data.budgetCalendarAligned,
-					};
+				// Add budgets if enabled
+				const validBudgets = (data.budgets || []).filter((b) => normalizeNumericField(b.max_limit) !== undefined);
+				const hadBudget = virtualKey.budgets && virtualKey.budgets.length > 0;
+				if (validBudgets.length > 0) {
+					updateData.budgets = validBudgets.map((b) => ({
+						max_limit: normalizeNumericField(b.max_limit)!,
+						reset_duration: b.reset_duration || "1M",
+					}));
+					updateData.calendar_aligned = data.budgetCalendarAligned;
 				} else if (hadBudget) {
-					updateData.budget = {};
+					updateData.budgets = [];
+					updateData.calendar_aligned = false;
 				}
 
 				// Add rate limit if enabled
-				const tokenMaxLimit = normalizeIntegerField(data.tokenMaxLimit);
-				const requestMaxLimit = normalizeIntegerField(data.requestMaxLimit);
+				const tokenMaxLimit = normalizeNumericField(data.tokenMaxLimit);
+				const requestMaxLimit = normalizeNumericField(data.requestMaxLimit);
 				const hadRateLimit = !!virtualKey.rate_limit;
 				const hasTokenMaxLimit = tokenMaxLimit !== undefined;
 				const hasRequestMaxLimit = requestMaxLimit !== undefined;
@@ -509,19 +477,19 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 					is_active: data.isActive,
 				};
 
-				// Add budget if enabled
-				const budgetMaxLimit = normalizeNumericField(data.budgetMaxLimit);
-				if (budgetMaxLimit !== undefined) {
-					createData.budget = {
-						max_limit: budgetMaxLimit,
-						reset_duration: data.budgetResetDuration || "1M",
-						calendar_aligned: data.budgetCalendarAligned,
-					};
+				// Add budgets if enabled
+				const validBudgets = (data.budgets || []).filter((b) => normalizeNumericField(b.max_limit) !== undefined);
+				if (validBudgets.length > 0) {
+					createData.budgets = validBudgets.map((b) => ({
+						max_limit: normalizeNumericField(b.max_limit)!,
+						reset_duration: b.reset_duration || "1M",
+					}));
+					createData.calendar_aligned = data.budgetCalendarAligned;
 				}
 
 				// Add rate limit if enabled
-				const tokenMaxLimit = normalizeIntegerField(data.tokenMaxLimit);
-				const requestMaxLimit = normalizeIntegerField(data.requestMaxLimit);
+				const tokenMaxLimit = normalizeNumericField(data.tokenMaxLimit);
+				const requestMaxLimit = normalizeNumericField(data.requestMaxLimit);
 				const hasTokenMaxLimit = tokenMaxLimit !== undefined;
 				const hasRequestMaxLimit = requestMaxLimit !== undefined;
 				if (hasTokenMaxLimit || hasRequestMaxLimit) {
@@ -936,14 +904,7 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 																				max_limit: String(b.max_limit ?? ""),
 																				reset_duration: b.reset_duration || "1M",
 																			}))
-																		: config.budget?.max_limit
-																			? [
-																					{
-																						max_limit: String(config.budget.max_limit),
-																						reset_duration: config.budget.reset_duration || "1M",
-																					},
-																				]
-																			: []
+																		: []
 																}
 																onChange={(lines) => {
 																	if (lines.length === 0) {
@@ -1244,38 +1205,20 @@ export default function VirtualKeySheet({ virtualKey, teams, customers, onSave, 
 							<div className="space-y-4">
 								<div className="flex items-center justify-between gap-2">
 									<Label className="text-sm font-medium">Budget Configuration</Label>
-									{isEditing && (virtualKey?.budget || watchedBudgetMaxLimit) && (
+									{isEditing && (virtualKey?.budgets?.length || (watchedBudgets && watchedBudgets.length > 0)) && (
 										<Button type="button" variant="ghost" size="sm" onClick={clearVirtualKeyBudget} data-testid="vk-budget-reset-button">
 											<RotateCcw className="h-4 w-4" />
 											Reset
 										</Button>
 									)}
 								</div>
-								<FormField
-									control={form.control}
-									name="budgetMaxLimit"
-									render={({ field }) => (
-										<FormItem>
-											<NumberAndSelect
-												id="budgetMaxLimit"
-												labelClassName="font-normal"
-												label="Maximum Spend (USD)"
-												value={field.value || ""}
-												selectValue={watchedBudgetResetDuration}
-												onChangeNumber={(value) => {
-													field.onChange(value);
-												}}
-												onChangeSelect={(value) => {
-													form.setValue("budgetResetDuration", value, { shouldDirty: true });
-													if (!supportsCalendarAlignment(value)) {
-														form.setValue("budgetCalendarAligned", false, { shouldDirty: true });
-													}
-												}}
-												options={resetDurationOptions}
-											/>
-											<FormMessage />
-										</FormItem>
-									)}
+								<MultiBudgetLines
+									id="vkBudget"
+									label="Maximum Spend (USD)"
+									lines={form.watch("budgets") ?? []}
+									onChange={(lines) => {
+										form.setValue("budgets", lines, { shouldDirty: true });
+									}}
 								/>
 
 								{/* Calendar alignment toggle — only shown when a budget is set and the period supports alignment */}
